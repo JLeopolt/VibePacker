@@ -105,27 +105,59 @@ def collect_paths(dirs: list[Path], recurse: bool) -> list[Path]:
     return paths
 
 
-def make_name(path: Path, source_dirs: list[Path], use_namespace: bool,
-              recurse: bool = False) -> tuple[str, int | None]:
+from enum import Enum, auto
+from dataclasses import dataclass as _dataclass
+
+
+class EntryKind(Enum):
+    PLAIN     = auto()   # single sprite — no folder grouping
+    VARIANT   = auto()   # named image inside a sprite folder  (stem is a word)
+    ANIMATION = auto()   # numbered frame inside an anim folder (stem is an int)
+
+
+@_dataclass
+class SpriteInfo:
+    """All metadata needed to place one PNG into the registry."""
+    key:     str         # top-level JSON key  (e.g. "wood_block", "dirt", "dodo_bird/idle")
+    kind:    EntryKind
+    variant: str | None  # for VARIANT: the image stem  ("default", "grassy")
+    index:   int | None  # for ANIMATION: the frame number
+
+
+def _is_int(s: str) -> bool:
+    return s.lstrip("-").isdigit()
+
+
+def classify_path(path: Path, source_dirs: list[Path],
+                  use_namespace: bool, recurse: bool) -> SpriteInfo:
     """
-    Derive a sprite key and optional variant index from a file path.
+    Derive a SpriteInfo from *path* according to the folder conventions below.
 
-    Returns (key, index_or_None).
+    Non-recurse mode
+    ----------------
+    Behaves as the original make_name: bare stem (with optional dir namespace),
+    old ``_<N>`` suffix grouping handled later by insert_sprite.
 
-    Recurse mode with a numeric stem
-    ---------------------------------
-    When ``recurse`` is True and the file stem is a pure integer, the stem
-    is treated as a variant index rather than part of the name.  The key
-    becomes the subfolder path *relative to the source dir* (no source-dir
-    name, no filename):
+    Recurse mode — three patterns (matched by folder depth & stem type)
+    -------------------------------------------------------------------
+    Pattern A — plain file directly in input dir
+        entities/wood_block.png
+        → key="wood_block", kind=PLAIN
 
-        entities/dodo_bird/idle/0.png  →  key="dodo_bird/idle",  index=0
+    Pattern B — named (non-numeric) images inside a single folder = named variants
+        entities/dirt/default.png
+        entities/dirt/grassy.png
+        → key="dirt", kind=VARIANT, variant="default" / "grassy"
 
-    Normal mode / non-numeric stem
-    --------------------------------
-    Behaves as before: the stem is appended to any namespace prefix and the
-    old ``_<N>`` variant detection in ``insert_variant`` handles grouping.
-    The returned index is None in this case.
+    Pattern C — numeric images inside a subfolder = animation frames
+        entities/dodo_bird/idle/0.png
+        → key="dodo_bird/idle", kind=ANIMATION, index=0
+
+    Pattern D — numeric images inside a sub-subfolder of a sprite folder
+    (animated tile variant, future): handled the same as C; the caller
+    aggregates under the parent sprite key via insert_sprite.
+        entities/dirt/rainbow/0.png
+        → key="dirt", kind=ANIMATION, variant="rainbow", index=0
     """
     stem = path.stem
 
@@ -135,70 +167,163 @@ def make_name(path: Path, source_dirs: list[Path], use_namespace: bool,
         except ValueError:
             continue
 
-        subparts = rel.parts[:-1]   # subdirectory components under input dir
+        parts = rel.parts          # (subdir…, filename.png) relative to input dir
+        subdirs = parts[:-1]       # directory components only
 
-        # ── recurse mode + numeric stem → folder-path key + index ──────────
-        if recurse and stem.lstrip("-").isdigit():
-            key = "/".join(subparts) if subparts else d.name
-            return key, int(stem)
+        if not recurse:
+            # ── non-recurse: plain key + optional namespace ─────────────────
+            if not use_namespace or not subdirs:
+                return SpriteInfo(stem, EntryKind.PLAIN, None, None)
+            prefix = "/".join([d.name] + list(subdirs))
+            return SpriteInfo(f"{prefix}/{stem}", EntryKind.PLAIN, None, None)
 
-        # ── standard behaviour ──────────────────────────────────────────────
-        if not use_namespace:
-            return stem, None
-        if subparts:
-            prefix = "/".join([d.name] + list(subparts))
-        else:
-            prefix = d.name
-        return f"{prefix}/{stem}", None
+        # ── recurse mode ────────────────────────────────────────────────────
+        depth = len(subdirs)   # 0 = directly in input dir
 
-    # Fallback (path not under any source dir)
-    return stem, None
+        if depth == 0:
+            # Pattern A: wood_block.png directly in the input dir
+            return SpriteInfo(stem, EntryKind.PLAIN, None, None)
+
+        if depth == 1:
+            folder = subdirs[0]
+            if _is_int(stem):
+                # Pattern C (shallow): dodo_bird/0.png — anim directly in sprite folder
+                # Treat the folder itself as the animation key
+                return SpriteInfo(folder, EntryKind.ANIMATION, None, int(stem))
+            else:
+                # Pattern B: dirt/default.png — named variant
+                return SpriteInfo(folder, EntryKind.VARIANT, stem, None)
+
+        if depth == 2:
+            sprite_folder = subdirs[0]
+            anim_folder   = subdirs[1]
+            if _is_int(stem):
+                if _is_int(anim_folder):
+                    # Deeply nested numeric — treat full path as anim key
+                    key = "/".join(subdirs)
+                    return SpriteInfo(key, EntryKind.ANIMATION, None, int(stem))
+                else:
+                    # Pattern D: dirt/rainbow/0.png — animated tile variant
+                    # key = sprite folder, variant = anim folder, index = frame
+                    return SpriteInfo(sprite_folder, EntryKind.ANIMATION,
+                                      anim_folder, int(stem))
+            else:
+                # Named image deep in tree: treat full path as variant key
+                key = "/".join(subdirs)
+                return SpriteInfo(key, EntryKind.VARIANT, stem, None)
+
+        # depth >= 3: generic fallback — full subfolder path + stem as key
+        key = "/".join(subdirs + (stem,))
+        return SpriteInfo(key, EntryKind.PLAIN, None, None)
+
+    # Path not under any source dir
+    return SpriteInfo(path.stem, EntryKind.PLAIN, None, None)
 
 
-def insert_variant(registry: dict, key: str, entry: dict,
-                   index=None) -> None:
+# keep old name as an alias so call-sites that still use it get a plain key
+def make_name(path: Path, source_dirs: list[Path], use_namespace: bool,
+              recurse: bool = False):
+    """Legacy shim — returns (key, index_or_None) for non-recurse callers."""
+    info = classify_path(path, source_dirs, use_namespace, recurse)
+    return info.key, info.index
+
+
+def insert_sprite(registry: dict, info: SpriteInfo, entry: dict) -> None:
     """
-    Insert a variant entry or plain entry into *registry*.
+    Insert *entry* into *registry* according to *info*.
 
-    Variant detection (two paths):
-      1. *index* is not None  → caller already resolved the index (numeric
-         filename mode).  ``key`` is the group name; entry gets {"index": index}.
-      2. *index* is None and *key* matches ``VARIANT_RE``  → classic
-         ``base_<N>`` suffix detection; the suffix is stripped and used as index.
-      3. Otherwise the entry is stored as a plain (non-list) value.
+    PLAIN   → registry[key] = entry  (scalar; warns on collision)
+    VARIANT → registry[key] = list of {"variant": name, …entry}
+    ANIMATION, variant=None   → registry[key] = list of {"index": N, …entry}
+    ANIMATION, variant=name   → registry[key] = list where the matching
+                                 variant item gets a "frames" sub-list
     """
-    if index is not None:
-        # Path 1: numeric-filename variant
-        full_entry = {"index": index, **entry}
-        if key not in registry:
-            registry[key] = []
-        elif not isinstance(registry[key], list):
-            registry[key] = [registry[key]]
-        registry[key].append(full_entry)
+    key     = info.key
+    kind    = info.kind
+    variant = info.variant
+    index   = info.index
+
+    if kind == EntryKind.PLAIN:
+        registry[key] = entry
         return
 
-    # Path 2 / 3: legacy _<N> suffix detection
+    if kind == EntryKind.VARIANT:
+        full = {"variant": variant, **entry}
+        if key not in registry:
+            registry[key] = [full]
+        else:
+            lst = registry[key] if isinstance(registry[key], list) else [registry[key]]
+            lst.append(full)
+            registry[key] = lst
+        return
+
+    # ANIMATION
+    if variant is None:
+        # Simple animation: registry[key] = [{index, …}, …]
+        full = {"index": index, **entry}
+        if key not in registry:
+            registry[key] = [full]
+        else:
+            lst = registry[key] if isinstance(registry[key], list) else [registry[key]]
+            lst.append(full)
+            registry[key] = lst
+    else:
+        # Animated variant: registry[key] is a variant list;
+        # find or create the entry for this variant name and append to its "frames"
+        if key not in registry:
+            registry[key] = []
+        lst = registry[key] if isinstance(registry[key], list) else [registry[key]]
+        # find existing variant bucket
+        bucket = next((v for v in lst if isinstance(v, dict)
+                       and v.get("variant") == variant), None)
+        if bucket is None:
+            bucket = {"variant": variant, "frames": []}
+            lst.append(bucket)
+        bucket.setdefault("frames", []).append({"index": index, **entry})
+        registry[key] = lst
+
+
+def insert_variant(registry: dict, key: str, entry: dict, index=None) -> None:
+    """
+    Legacy shim used by non-recurse / uniform callers.
+
+    When *index* is provided the entry is treated as an animation frame.
+    Otherwise the old ``_<N>`` suffix detection applies.
+    """
+    if index is not None:
+        info = SpriteInfo(key, EntryKind.ANIMATION, None, index)
+        insert_sprite(registry, info, entry)
+        return
+
     m = VARIANT_RE.match(key)
     if m:
         base, idx = m.group(1), int(m.group(2))
-        full_entry = {"index": idx, **entry}
-        if base not in registry:
-            registry[base] = []
-        elif not isinstance(registry[base], list):
-            # A plain entry already occupied this base name; wrap it
-            registry[base] = [registry[base]]
-        registry[base].append(full_entry)
+        info = SpriteInfo(base, EntryKind.ANIMATION, None, idx)
+        insert_sprite(registry, info, entry)
     else:
-        if key in registry and isinstance(registry[key], list):
-            registry[key].append(entry)
-        else:
-            registry[key] = entry
+        registry[key] = entry
 
 
 def sort_variants(registry: dict) -> None:
     for key, val in registry.items():
-        if isinstance(val, list):
-            registry[key] = sorted(val, key=lambda e: e.get("index", 0))
+        if not isinstance(val, list):
+            continue
+        # Sort frames within any animated-variant buckets
+        for item in val:
+            if isinstance(item, dict) and "frames" in item:
+                item["frames"] = sorted(item["frames"],
+                                        key=lambda e: e.get("index", 0))
+        # Sort the top-level list: named variants first (by name), then
+        # animation-only entries (by index), plain entries last
+        def sort_key(e):
+            if not isinstance(e, dict):
+                return (2, 0, "")
+            if "frames" in e:
+                return (1, 0, e.get("variant", ""))
+            if "variant" in e:
+                return (0, 0, e.get("variant", ""))
+            return (1, e.get("index", 0), "")
+        registry[key] = sorted(val, key=sort_key)
 
 
 def print_summary(registry: dict, mode: str, sheet_w: int, sheet_h: int,
@@ -238,16 +363,20 @@ def run_uniform(args: argparse.Namespace) -> None:
           f"padding={padding}px")
 
     # Load & validate ---------------------------------------------------------
-    images: list[tuple[str, Image.Image, object]] = []
+    images: list[tuple[SpriteInfo, Image.Image]] = []
     for p in paths:
-        img = Image.open(p).convert("RGBA")
-        name, idx = make_name(p, source_dirs, use_ns, recurse=args.recurse)
+        img  = Image.open(p).convert("RGBA")
+        info = classify_path(p, source_dirs, use_ns, recurse=args.recurse)
         if img.size != (tile_size, tile_size):
             print(f"  WARNING: {p.name} is {img.width}x{img.height}, "
                   f"expected {tile_size}x{tile_size} - resizing.")
             img = img.resize((tile_size, tile_size), Image.NEAREST)
-        images.append((name, img, idx))
-        print(f"  {name}" + (f"  [index {idx}]" if idx is not None else ""))
+        images.append((info, img))
+        tag = (f"  [{info.kind.name.lower()}"
+               + (f" variant={info.variant}" if info.variant else "")
+               + (f" index={info.index}"   if info.index is not None else "")
+               + "]")
+        print(f"  {info.key}{tag if info.kind != EntryKind.PLAIN else ''}")
 
     count   = len(images)
     padded  = tile_size + padding * 2
@@ -271,14 +400,14 @@ def run_uniform(args: argparse.Namespace) -> None:
     registry: dict = {}
     used_px = 0
 
-    for i, (name, img, idx) in enumerate(images):
+    for i, (info, img) in enumerate(images):
         col = i % cols
         row = i // cols
         px  = col * padded + padding
         py  = row * padded + padding
         sheet.paste(img, (px, py))
         used_px += tile_size * tile_size
-        insert_variant(registry, name, {"atlas_coords": [col, row]}, index=idx)
+        insert_sprite(registry, info, {"atlas_coords": [col, row]})
 
     sort_variants(registry)
 
@@ -460,45 +589,47 @@ def run_variable(args: argparse.Namespace) -> None:
           + (" +trim" if args.trim else ""))
 
     # Load images -------------------------------------------------------------
-    sprites: list[tuple[str, Image.Image, Optional[tuple], object]] = []
+    sprites: list[tuple[SpriteInfo, Image.Image, Optional[tuple]]] = []
     for p in paths:
         img  = Image.open(p).convert("RGBA")
-        name, idx = make_name(p, source_dirs, use_ns, recurse=args.recurse)
+        info = classify_path(p, source_dirs, use_ns, recurse=args.recurse)
         trim = None
         if args.trim:
             orig_w, orig_h = img.size
             bbox = img.getbbox()
             if bbox:
-                trim = bbox          # (left, top, right, bottom)
+                trim = bbox
                 img  = img.crop(bbox)
             else:
                 trim = (0, 0, orig_w, orig_h)
-        sprites.append((name, img, trim, idx))
-        size_str = f"{img.width}×{img.height}"
-        trim_str = f"  [trimmed from {orig_w}×{orig_h}]" if trim and args.trim else ""
-        idx_str  = f"  [index {idx}]" if idx is not None else ""
-        print(f"  {name:50s}  {size_str}{trim_str}{idx_str}")
+        sprites.append((info, img, trim))
+        size_str = f"{img.width}\u00d7{img.height}"
+        trim_str = f"  [trimmed from {orig_w}\u00d7{orig_h}]" if trim and args.trim else ""
+        tag = (f"  [{info.kind.name.lower()}"
+               + (f" variant={info.variant}" if info.variant else "")
+               + (f" index={info.index}"   if info.index is not None else "")
+               + "]")
+        label = f"{info.key}{tag if info.kind != EntryKind.PLAIN else ''}"
+        print(f"  {label:60s}  {size_str}{trim_str}")
 
     # Sort largest-first for better packing -----------------------------------
     sprites.sort(key=lambda s: s[1].width * s[1].height, reverse=True)
 
     print(f"\n[variable] Packing (max-size={args.max_size}px) ...")
-    # Pack using only the first three elements (name, img, trim)
-    # Attach a unique tag so we can recover the per-sprite index after packing.
+    # Tag each sprite with a unique id so the packer can reference it
     tagged: list[tuple[str, Image.Image, Optional[tuple]]] = []
-    tag_to_idx: dict[str, int] = {}
-    for pos, (name, img, trim, file_idx) in enumerate(sprites):
-        tag = f"\x00{pos}\x00{name}"          # unique key, never a real filename
+    tag_to_info: dict[str, SpriteInfo] = {}
+    for pos, (info, img, trim) in enumerate(sprites):
+        tag = f"\x00{pos}"
         tagged.append((tag, img, trim))
-        if file_idx is not None:
-            tag_to_idx[tag] = file_idx
+        tag_to_info[tag] = info
 
     packer = MaxRectsPacker(max_size=args.max_size, padding=padding)
     if not packer.pack(tagged):
         sys.exit("ERROR: Could not fit all sprites within the maximum atlas size. "
                  "Try --max-size with a larger value.")
 
-    print(f"  Sheet: {packer.width}×{packer.height}px")
+    print(f"  Sheet: {packer.width}\u00d7{packer.height}px")
 
     # Render atlas ------------------------------------------------------------
     atlas = Image.new("RGBA", (packer.width, packer.height), (0, 0, 0, 0))
@@ -510,25 +641,19 @@ def run_variable(args: argparse.Namespace) -> None:
     registry: dict = {}
     used_px   = 0
 
-    # Decode tag → real name
-    def decode_tag(tag: str) -> str:
-        """Strip the unique position prefix added during packing."""
-        parts = tag.split("\x00")
-        return parts[-1]  # last part is the real name
-
     for tag, rect, trim in packer.placements:
-        name = decode_tag(tag)
+        info = tag_to_info[tag]
+        img  = sprite_lookup[tag]
         used_px += rect.w * rect.h
         entry: dict = {"x": rect.x, "y": rect.y, "w": rect.w, "h": rect.h}
         if trim:
-            img = sprite_lookup[tag]
             entry["trim"] = {
                 "left":       trim[0],
                 "top":        trim[1],
                 "original_w": img.width  + trim[0] + (trim[2] - img.width  - trim[0]),
                 "original_h": img.height + trim[1] + (trim[3] - img.height - trim[1]),
             }
-        insert_variant(registry, name, entry, index=tag_to_idx.get(tag))
+        insert_sprite(registry, info, entry)
 
     sort_variants(registry)
 
