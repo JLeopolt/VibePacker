@@ -105,33 +105,79 @@ def collect_paths(dirs: list[Path], recurse: bool) -> list[Path]:
     return paths
 
 
-def make_name(path: Path, source_dirs: list[Path], use_namespace: bool) -> str:
+def make_name(path: Path, source_dirs: list[Path], use_namespace: bool,
+              recurse: bool = False) -> tuple[str, int | None]:
     """
-    Derive a sprite key from a file path.
+    Derive a sprite key and optional variant index from a file path.
 
-    If use_namespace is True and the file's parent dir name is one of the
-    source dirs, the dir stem is prepended: "player/torso".
-    Otherwise just the file stem is used.
+    Returns (key, index_or_None).
+
+    Recurse mode with a numeric stem
+    ---------------------------------
+    When ``recurse`` is True and the file stem is a pure integer, the stem
+    is treated as a variant index rather than part of the name.  The key
+    becomes the subfolder path *relative to the source dir* (no source-dir
+    name, no filename):
+
+        entities/dodo_bird/idle/0.png  →  key="dodo_bird/idle",  index=0
+
+    Normal mode / non-numeric stem
+    --------------------------------
+    Behaves as before: the stem is appended to any namespace prefix and the
+    old ``_<N>`` variant detection in ``insert_variant`` handles grouping.
+    The returned index is None in this case.
     """
     stem = path.stem
-    if not use_namespace:
-        return stem
+
     for d in source_dirs:
         try:
             rel = path.relative_to(d)
-            parts = rel.parts[:-1]          # subdirs relative to input dir
-            prefix = "/".join([d.name] + list(parts))
-            return f"{prefix}/{stem}"
         except ValueError:
             continue
-    return stem
+
+        subparts = rel.parts[:-1]   # subdirectory components under input dir
+
+        # ── recurse mode + numeric stem → folder-path key + index ──────────
+        if recurse and stem.lstrip("-").isdigit():
+            key = "/".join(subparts) if subparts else d.name
+            return key, int(stem)
+
+        # ── standard behaviour ──────────────────────────────────────────────
+        if not use_namespace:
+            return stem, None
+        if subparts:
+            prefix = "/".join([d.name] + list(subparts))
+        else:
+            prefix = d.name
+        return f"{prefix}/{stem}", None
+
+    # Fallback (path not under any source dir)
+    return stem, None
 
 
-def insert_variant(registry: dict, key: str, entry: dict) -> None:
+def insert_variant(registry: dict, key: str, entry: dict,
+                   index=None) -> None:
     """
-    Insert a variant entry (has 'index' key) or plain entry into registry,
-    grouping variants into lists and sorting at the end.
+    Insert a variant entry or plain entry into *registry*.
+
+    Variant detection (two paths):
+      1. *index* is not None  → caller already resolved the index (numeric
+         filename mode).  ``key`` is the group name; entry gets {"index": index}.
+      2. *index* is None and *key* matches ``VARIANT_RE``  → classic
+         ``base_<N>`` suffix detection; the suffix is stripped and used as index.
+      3. Otherwise the entry is stored as a plain (non-list) value.
     """
+    if index is not None:
+        # Path 1: numeric-filename variant
+        full_entry = {"index": index, **entry}
+        if key not in registry:
+            registry[key] = []
+        elif not isinstance(registry[key], list):
+            registry[key] = [registry[key]]
+        registry[key].append(full_entry)
+        return
+
+    # Path 2 / 3: legacy _<N> suffix detection
     m = VARIANT_RE.match(key)
     if m:
         base, idx = m.group(1), int(m.group(2))
@@ -192,16 +238,16 @@ def run_uniform(args: argparse.Namespace) -> None:
           f"padding={padding}px")
 
     # Load & validate ---------------------------------------------------------
-    images: list[tuple[str, Image.Image]] = []
+    images: list[tuple[str, Image.Image, object]] = []
     for p in paths:
         img = Image.open(p).convert("RGBA")
-        name = make_name(p, source_dirs, use_ns)
+        name, idx = make_name(p, source_dirs, use_ns, recurse=args.recurse)
         if img.size != (tile_size, tile_size):
             print(f"  WARNING: {p.name} is {img.width}x{img.height}, "
                   f"expected {tile_size}x{tile_size} - resizing.")
             img = img.resize((tile_size, tile_size), Image.NEAREST)
-        images.append((name, img))
-        print(f"  {name}")
+        images.append((name, img, idx))
+        print(f"  {name}" + (f"  [index {idx}]" if idx is not None else ""))
 
     count   = len(images)
     padded  = tile_size + padding * 2
@@ -225,14 +271,14 @@ def run_uniform(args: argparse.Namespace) -> None:
     registry: dict = {}
     used_px = 0
 
-    for idx, (name, img) in enumerate(images):
-        col = idx % cols
-        row = idx // cols
+    for i, (name, img, idx) in enumerate(images):
+        col = i % cols
+        row = i // cols
         px  = col * padded + padding
         py  = row * padded + padding
         sheet.paste(img, (px, py))
         used_px += tile_size * tile_size
-        insert_variant(registry, name, {"atlas_coords": [col, row]})
+        insert_variant(registry, name, {"atlas_coords": [col, row]}, index=idx)
 
     sort_variants(registry)
 
@@ -414,10 +460,10 @@ def run_variable(args: argparse.Namespace) -> None:
           + (" +trim" if args.trim else ""))
 
     # Load images -------------------------------------------------------------
-    sprites: list[tuple[str, Image.Image, Optional[tuple]]] = []
+    sprites: list[tuple[str, Image.Image, Optional[tuple], object]] = []
     for p in paths:
         img  = Image.open(p).convert("RGBA")
-        name = make_name(p, source_dirs, use_ns)
+        name, idx = make_name(p, source_dirs, use_ns, recurse=args.recurse)
         trim = None
         if args.trim:
             orig_w, orig_h = img.size
@@ -427,17 +473,28 @@ def run_variable(args: argparse.Namespace) -> None:
                 img  = img.crop(bbox)
             else:
                 trim = (0, 0, orig_w, orig_h)
-        sprites.append((name, img, trim))
+        sprites.append((name, img, trim, idx))
         size_str = f"{img.width}×{img.height}"
         trim_str = f"  [trimmed from {orig_w}×{orig_h}]" if trim and args.trim else ""
-        print(f"  {name:50s}  {size_str}{trim_str}")
+        idx_str  = f"  [index {idx}]" if idx is not None else ""
+        print(f"  {name:50s}  {size_str}{trim_str}{idx_str}")
 
     # Sort largest-first for better packing -----------------------------------
     sprites.sort(key=lambda s: s[1].width * s[1].height, reverse=True)
 
     print(f"\n[variable] Packing (max-size={args.max_size}px) ...")
+    # Pack using only the first three elements (name, img, trim)
+    # Attach a unique tag so we can recover the per-sprite index after packing.
+    tagged: list[tuple[str, Image.Image, Optional[tuple]]] = []
+    tag_to_idx: dict[str, int] = {}
+    for pos, (name, img, trim, file_idx) in enumerate(sprites):
+        tag = f"\x00{pos}\x00{name}"          # unique key, never a real filename
+        tagged.append((tag, img, trim))
+        if file_idx is not None:
+            tag_to_idx[tag] = file_idx
+
     packer = MaxRectsPacker(max_size=args.max_size, padding=padding)
-    if not packer.pack(sprites):
+    if not packer.pack(tagged):
         sys.exit("ERROR: Could not fit all sprites within the maximum atlas size. "
                  "Try --max-size with a larger value.")
 
@@ -445,31 +502,33 @@ def run_variable(args: argparse.Namespace) -> None:
 
     # Render atlas ------------------------------------------------------------
     atlas = Image.new("RGBA", (packer.width, packer.height), (0, 0, 0, 0))
-    sprite_lookup = {name: img for name, img, _ in sprites}
-    for name, rect, _ in packer.placements:
-        atlas.paste(sprite_lookup[name], (rect.x, rect.y))
+    sprite_lookup = {tag: img for tag, img, _ in tagged}
+    for tag, rect, _ in packer.placements:
+        atlas.paste(sprite_lookup[tag], (rect.x, rect.y))
 
     # Build JSON manifest -----------------------------------------------------
     registry: dict = {}
     used_px   = 0
 
-    for name, rect, trim in packer.placements:
+    # Decode tag → real name
+    def decode_tag(tag: str) -> str:
+        """Strip the unique position prefix added during packing."""
+        parts = tag.split("\x00")
+        return parts[-1]  # last part is the real name
+
+    for tag, rect, trim in packer.placements:
+        name = decode_tag(tag)
         used_px += rect.w * rect.h
         entry: dict = {"x": rect.x, "y": rect.y, "w": rect.w, "h": rect.h}
         if trim:
-            # Store trim offsets so the caller can reconstruct the original rect
-            entry["trim"] = {
-                "left": trim[0], "top": trim[1],
-                "original_w": trim[2] - trim[0],   # won't be right – fix below
-            }
-            # Recalculate properly from the stored bbox
+            img = sprite_lookup[tag]
             entry["trim"] = {
                 "left":       trim[0],
                 "top":        trim[1],
-                "original_w": sprite_lookup[name].width  + trim[0] + (trim[2] - sprite_lookup[name].width  - trim[0]),
-                "original_h": sprite_lookup[name].height + trim[1] + (trim[3] - sprite_lookup[name].height - trim[1]),
+                "original_w": img.width  + trim[0] + (trim[2] - img.width  - trim[0]),
+                "original_h": img.height + trim[1] + (trim[3] - img.height - trim[1]),
             }
-        insert_variant(registry, name, entry)
+        insert_variant(registry, name, entry, index=tag_to_idx.get(tag))
 
     sort_variants(registry)
 
