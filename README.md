@@ -18,6 +18,15 @@ Otherwise if your textures are all different sizes, use the `variable` mode.
 This will include the exact x,y coordinates and width/height in pixels in the atlas for each entry.
 See the `Help` section for further usage instructions.
 
+### Usage Addendum
+Improved sprite variant handling. Now instead of numbering sprites like dirt_0, dirt_1 for variants, 
+just create a folder called dirt and include variant files like default.png, grassy.png. 
+Additionally, animations can be created by making a subfolder within a textures folder like bird/fly and 
+numbering keyframes as 0.png, 1.png, etc. Currently animations dont support variants, 
+but variants and animations can exist independently of each other for a given texture, 
+e.g. torch/ can contain files default.png, green.png, while also containing a subfolder torch/flicker containing 0.png, 1.png. 
+This defines torch as having two variants, and an animation called flicker.
+
 ## Help
 Use the `-h` argument to see all available options.
 Open the main `vibepack.py` file to read the documentation, and peruse the code as you like.
