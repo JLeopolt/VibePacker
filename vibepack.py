@@ -17,9 +17,29 @@ Two packing modes
 
 Variant grouping
 ----------------
-  Files whose stems share a base name and end with _<number> are grouped:
-    dirt_0.png + dirt_1.png  →  "dirt": [{"index":0,...}, {"index":1,...}]
+  Files whose stems share a base name and end with _<number> are grouped as
+  animated tiles under a "default" variant:
+    portal_0.png + portal_1.png + portal_2.png
+      →  "portal": [{"variant": "default", "frames": [{"index":0,"atlas_coords":[…]}, …]}]
   Plain files become single-object entries.
+
+Animated tile conventions (uniform mode, --recurse)
+----------------------------------------------------
+  Three folder layouts are recognised:
+
+  Flat frames (default variant):
+    tiles/portal/0.png, 1.png, 2.png
+      → "portal": [{"variant": "default", "frames": [{index, atlas_coords}, …]}]
+
+  Named variant frames:
+    tiles/portal/rainbow/0.png, 1.png
+      → "portal": [{"variant": "rainbow", "frames": [{index, atlas_coords}, …]}]
+
+  Multiple animated variants alongside a static default:
+    tiles/portal/default.png          (static fallback / thumbnail)
+    tiles/portal/rainbow/0.png, 1.png
+      → "portal": [{"variant": "default", "atlas_coords": […]},
+                   {"variant": "rainbow", "frames": [{…}, …]}]
 
 Namespace collision handling
 ----------------------------
@@ -287,18 +307,21 @@ def insert_variant(registry: dict, key: str, entry: dict, index=None) -> None:
     """
     Legacy shim used by non-recurse / uniform callers.
 
-    When *index* is provided the entry is treated as an animation frame.
-    Otherwise the old ``_<N>`` suffix detection applies.
+    When *index* is provided the entry is treated as an animation frame and
+    is grouped under the "default" variant so the output matches the
+    animated-tile shape:  {"variant": "default", "frames": [{index, …}, …]}
+
+    Otherwise the old ``_<N>`` suffix detection applies with the same rule.
     """
     if index is not None:
-        info = SpriteInfo(key, EntryKind.ANIMATION, None, index)
+        info = SpriteInfo(key, EntryKind.ANIMATION, "default", index)
         insert_sprite(registry, info, entry)
         return
 
     m = VARIANT_RE.match(key)
     if m:
         base, idx = m.group(1), int(m.group(2))
-        info = SpriteInfo(base, EntryKind.ANIMATION, None, idx)
+        info = SpriteInfo(base, EntryKind.ANIMATION, "default", idx)
         insert_sprite(registry, info, entry)
     else:
         registry[key] = entry
@@ -407,7 +430,19 @@ def run_uniform(args: argparse.Namespace) -> None:
         py  = row * padded + padding
         sheet.paste(img, (px, py))
         used_px += tile_size * tile_size
-        insert_sprite(registry, info, {"atlas_coords": [col, row]})
+        coords_entry = {"atlas_coords": [col, row]}
+        if args.recurse:
+            # Recurse mode: classify_path already resolved kind/variant/index.
+            # For ANIMATION entries with no explicit variant name, promote to
+            # "default" so all animated tiles share the same output shape:
+            #   {"variant": "default", "frames": [{index, atlas_coords}, …]}
+            if info.kind == EntryKind.ANIMATION and info.variant is None:
+                info = SpriteInfo(info.key, EntryKind.ANIMATION, "default", info.index)
+            insert_sprite(registry, info, coords_entry)
+        else:
+            # Flat mode: use insert_variant so portal_0/_1/_2 groups into
+            # animated-default-variant shape rather than staying as plain keys
+            insert_variant(registry, info.key, coords_entry, info.index)
 
     sort_variants(registry)
 
