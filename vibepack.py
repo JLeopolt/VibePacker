@@ -404,45 +404,82 @@ def run_uniform(args: argparse.Namespace) -> None:
     count   = len(images)
     padded  = tile_size + padding * 2
 
-    # Calculate grid dimensions (square-ish, power-of-2 columns & rows) ------
-    cols = next_po2(math.ceil(math.sqrt(count)))
+    # Group animated frame sequences so we can measure their widths -----------
+    # Each group is a list of (info, img) that must be placed consecutively
+    # on the same row. Static tiles are groups of size 1.
+    #
+    # In recurse mode, classify_path sets kind=ANIMATION for frame images.
+    # In flat mode, frames arrive as PLAIN with keys like "portal_0", so we
+    # also match them via VARIANT_RE to group them correctly for row-placement.
+    groups: list[list[tuple[SpriteInfo, Image.Image]]] = []
+    _pending: dict[tuple, list] = {}  # (key, variant) -> open group
+
+    for info, img in images:
+        anim_key: tuple | None = None
+        if info.kind == EntryKind.ANIMATION:
+            anim_key = (info.key, info.variant)
+        elif not args.recurse:
+            m = VARIANT_RE.match(info.key)
+            if m:
+                anim_key = (m.group(1), "default")
+
+        if anim_key is not None:
+            if anim_key not in _pending:
+                _pending[anim_key] = []
+                groups.append(_pending[anim_key])
+            _pending[anim_key].append((info, img))
+        else:
+            groups.append([(info, img)])
+
+    # Calculate grid columns wide enough to fit the largest animation group ---
+    max_group = max(len(g) for g in groups)
+    cols = next_po2(max(math.ceil(math.sqrt(count)), max_group))
     rows = next_po2(math.ceil(count / cols))
     while cols * rows < count:
         rows = next_po2(rows + 1)
 
-    sheet_w = cols * padded
-    sheet_h = rows * padded
-    # Snap to power-of-2 overall dimensions
-    sheet_w = next_po2(sheet_w)
-    sheet_h = next_po2(sheet_h)
+    sheet_w = next_po2(cols * padded)
+    sheet_h = next_po2(rows * padded)
 
     print(f"\n[uniform] Sheet: {sheet_w}x{sheet_h}px  ({cols}x{rows} tiles)")
 
-    # Render ------------------------------------------------------------------
-    sheet = Image.new("RGBA", (sheet_w, sheet_h), (0, 0, 0, 0))
+    # Render — row-aware cursor -----------------------------------------------
+    # Animated groups must not wrap across rows (Godot reads frames left→right).
+    # If a group doesn't fit in the remaining columns of the current row,
+    # advance the cursor to the start of the next row before placing it.
+    sheet    = Image.new("RGBA", (sheet_w, sheet_h), (0, 0, 0, 0))
     registry: dict = {}
-    used_px = 0
+    used_px  = 0
+    cursor   = 0  # flat tile index; col = cursor % cols, row = cursor // cols
 
-    for i, (info, img) in enumerate(images):
-        col = i % cols
-        row = i // cols
-        px  = col * padded + padding
-        py  = row * padded + padding
-        sheet.paste(img, (px, py))
-        used_px += tile_size * tile_size
-        coords_entry = {"atlas_coords": [col, row]}
-        if args.recurse:
-            # Recurse mode: classify_path already resolved kind/variant/index.
-            # For ANIMATION entries with no explicit variant name, promote to
-            # "default" so all animated tiles share the same output shape:
-            #   {"variant": "default", "frames": [{index, atlas_coords}, …]}
-            if info.kind == EntryKind.ANIMATION and info.variant is None:
-                info = SpriteInfo(info.key, EntryKind.ANIMATION, "default", info.index)
-            insert_sprite(registry, info, coords_entry)
-        else:
-            # Flat mode: use insert_variant so portal_0/_1/_2 groups into
-            # animated-default-variant shape rather than staying as plain keys
-            insert_variant(registry, info.key, coords_entry, info.index)
+    for group in groups:
+        group_len = len(group)
+        col_start = cursor % cols
+        # If the group would wrap, pad cursor to the next row boundary
+        if group_len > 1 and col_start + group_len > cols:
+            cursor += cols - col_start  # skip remaining slots on this row
+
+        for info, img in group:
+            col = cursor % cols
+            row = cursor // cols
+            px  = col * padded + padding
+            py  = row * padded + padding
+            sheet.paste(img, (px, py))
+            used_px += tile_size * tile_size
+            coords_entry = {"atlas_coords": [col, row]}
+            if args.recurse:
+                # Recurse mode: classify_path already resolved kind/variant/index.
+                # For ANIMATION entries with no explicit variant name, promote to
+                # "default" so all animated tiles share the same output shape:
+                #   {"variant": "default", "frames": [{index, atlas_coords}, …]}
+                if info.kind == EntryKind.ANIMATION and info.variant is None:
+                    info = SpriteInfo(info.key, EntryKind.ANIMATION, "default", info.index)
+                insert_sprite(registry, info, coords_entry)
+            else:
+                # Flat mode: use insert_variant so portal_0/_1/_2 groups into
+                # animated-default-variant shape rather than staying as plain keys
+                insert_variant(registry, info.key, coords_entry, info.index)
+            cursor += 1
 
     sort_variants(registry)
 
