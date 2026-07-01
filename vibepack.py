@@ -434,9 +434,23 @@ def run_uniform(args: argparse.Namespace) -> None:
     # Calculate grid columns wide enough to fit the largest animation group ---
     max_group = max(len(g) for g in groups)
     cols = next_po2(max(math.ceil(math.sqrt(count)), max_group))
-    rows = next_po2(math.ceil(count / cols))
-    while cols * rows < count:
-        rows = next_po2(rows + 1)
+
+    # Simulate cursor placement to find the true row count.
+    # ceil(count / cols) underestimates when animated groups bump the cursor
+    # to the next row boundary, wasting the trailing slots on the current row.
+    def simulate_rows(cols: int) -> int:
+        cursor = 0
+        for group in groups:
+            group_len = len(group)
+            col_start = cursor % cols
+            if group_len > 1 and col_start + group_len > cols:
+                cursor += cols - col_start
+            cursor += group_len
+        last_col = (cursor - 1) % cols
+        last_row = (cursor - 1) // cols
+        return last_row + 1
+
+    rows = next_po2(simulate_rows(cols))
 
     sheet_w = next_po2(cols * padded)
     sheet_h = next_po2(rows * padded)
