@@ -116,8 +116,9 @@ def collect_paths(dirs: list[Path], recurse: bool) -> list[Path]:
     seen: set[Path] = set()
     paths: list[Path] = []
     for d in dirs:
-        glob = d.rglob("*.png") if recurse else d.glob("*.png")
-        for p in sorted(glob):
+        candidates = d.rglob("*") if recurse else d.glob("*")
+        found = [p for p in candidates if p.is_file() and p.suffix.lower() == ".png"]
+        for p in sorted(found, key=lambda p: p.parts):
             rp = p.resolve()
             if rp not in seen:
                 seen.add(rp)
